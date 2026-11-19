@@ -21,6 +21,7 @@ DNSSEC Functions
 .. autofunction:: dns.dnssec.validate
 .. autofunction:: dns.dnssec.validate_rrsig
 .. autofunction:: dns.dnssec.nsec3_hash
+.. autofunction:: dns.dnssec.validate_nsec3_chain
 .. autofunction:: dns.dnssec.make_ds_rdataset()
 .. autofunction:: dns.dnssec.cds_rdataset_to_ds_rdataset()
 .. autofunction:: dns.dnssec.dnskey_rdataset_to_cds_rdataset()

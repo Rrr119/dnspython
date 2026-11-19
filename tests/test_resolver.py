@@ -30,9 +30,11 @@ import pytest
 import dns.asyncbackend
 import dns.asyncresolver
 import dns.e164
+import dns.flags
 import dns.message
 import dns.name
 import dns.quic
+import dns.rdata
 import dns.rdataclass
 import dns.rdatatype
 import dns.resolver
@@ -187,6 +189,58 @@ class FakeAnswer(object):
         self.expiration = expiration
 
 
+class FakeNameserver(dns.nameserver.Nameserver):
+    def __init__(self, name, error=None):
+        super().__init__()
+        self.name = name
+        self.error = error
+        self.calls = 0
+
+    def kind(self):
+        return "fake"
+
+    def __str__(self):
+        return self.name
+
+    def is_always_max_size(self):
+        return False
+
+    def answer_nameserver(self):
+        return self.name
+
+    def answer_port(self):
+        return 53
+
+    def query(
+        self,
+        request,
+        timeout,
+        source,
+        source_port,
+        max_size,
+        one_rr_per_rrset=False,
+        ignore_trailing=False,
+    ):
+        self.calls += 1
+        if self.error is not None:
+            raise self.error
+        response = dns.message.make_response(request)
+        response.flags |= dns.flags.RA
+        question = request.question[0]
+        rrset = response.find_rrset(
+            response.answer,
+            question.name,
+            question.rdclass,
+            question.rdtype,
+            create=True,
+        )
+        rrset.add(
+            dns.rdata.from_text(question.rdclass, question.rdtype, "192.0.2.1"),
+            60,
+        )
+        return response
+
+
 class FakeTime:
     # Mock the clock!
     def __init__(self, now=None, want_fake=True):
@@ -304,6 +358,25 @@ class BaseResolverTests(unittest.TestCase):
             self.assertTrue(
                 cache.get((name, dns.rdatatype.A, dns.rdataclass.IN)) is None
             )
+
+    def testCacheTTLDecreases(self):
+        with FakeTime() as fake_time:
+            message = dns.message.from_text(message_text)
+            name = dns.name.from_text("example.")
+            answer = dns.resolver.Answer(
+                name, dns.rdatatype.A, dns.rdataclass.IN, message
+            )
+            cache = dns.resolver.Cache()
+            key = (name, dns.rdatatype.A, dns.rdataclass.IN)
+            cache.put(key, answer)
+            self.assertEqual(answer.ttl, 1)
+            fake_time.sleep(0.5)
+            self.assertIs(cache.get(key), answer)
+            self.assertEqual(answer.ttl, 1)
+            self.assertEqual(answer.remaining_ttl, 1)
+            fake_time.sleep(0.5)
+            self.assertIsNone(cache.get(key))
+            self.assertEqual(answer.ttl, 0)
 
     def testCacheNegativeWithoutSOA(self):
         # A negative answer with no SOA is cached for the default negative
@@ -1065,6 +1138,26 @@ class ResolverNameserverValidTypeTestCase(unittest.TestCase):
         resolver = dns.resolver.Resolver(configure=False)
         resolver.nameservers = []
         self.assertEqual(resolver.nameservers, [])
+
+    def testFallbackNameserverSetting(self):
+        resolver = dns.resolver.Resolver(configure=False)
+        fallback = ["https://dns.example/dns-query"]
+        resolver.fallback_nameservers = fallback
+        self.assertEqual(resolver.fallback_nameservers, fallback)
+        with self.assertRaises(ValueError):
+            resolver.fallback_nameservers = ["bogus://dns.example"]
+
+    def testDoHFallbackAfterPrimaryFailure(self):
+        primary = FakeNameserver("primary", OSError("unreachable"))
+        fallback = FakeNameserver("https://dns.example/dns-query")
+        resolver = dns.resolver.Resolver(configure=False)
+        resolver.nameservers = [primary]
+        resolver.fallback_nameservers = [fallback]
+        answer = resolver.resolve("example.", "A")
+        self.assertEqual(primary.calls, 1)
+        self.assertEqual(fallback.calls, 1)
+        self.assertEqual(answer.nameserver, fallback.answer_nameserver())
+        self.assertEqual(answer[0].address, "192.0.2.1")
 
     def test_set_nameservers_invalid_type(self):
         resolver = dns.resolver.Resolver(configure=False)

@@ -764,6 +764,80 @@ ns3.sub.example. 3600 IN A 10.0.0.3
 
 @unittest.skipUnless(dns.dnssec._have_pyca, "Python Cryptography cannot be imported")
 class DNSSECValidatorTestCase(unittest.TestCase):
+    def _make_signed_nsec3_chain(self):
+        origin = dns.name.from_text("example.")
+        private_key = ed25519.Ed25519PrivateKey.generate()
+        dnskey = dns.dnssec.make_dnskey(
+            private_key.public_key(), dns.dnssec.Algorithm.ED25519
+        )
+        keys = {origin: dns.rrset.from_rdata(origin, 300, dnskey)}
+        now = int(time.time())
+        hashes = sorted(
+            dns.dnssec.nsec3_hash(f"host{i}.example.", b"salt", 1, "SHA1")
+            for i in range(3)
+        )
+        rrsets = []
+        for i, hashed_owner in enumerate(hashes):
+            next_hashed_owner = hashes[(i + 1) % len(hashes)]
+            rrset = dns.rrset.from_text(
+                f"{hashed_owner}.example.",
+                300,
+                "IN",
+                "NSEC3",
+                f"1 0 1 73616c74 {next_hashed_owner} A RRSIG",
+            )
+            rrsig = dns.dnssec.sign(
+                rrset,
+                private_key,
+                origin,
+                dnskey,
+                inception=now - 60,
+                expiration=now + 3600,
+            )
+            rrsets.append(rrset)
+            rrsets.append(dns.rrset.from_rdata(rrset.name, 300, rrsig))
+        return rrsets, keys, origin, now
+
+    def testNSEC3ChainGood(self):
+        rrsets, keys, origin, now = self._make_signed_nsec3_chain()
+        dns.dnssec.validate_nsec3_chain(rrsets, keys, origin, now)
+
+    def testNSEC3ChainFromZone(self):
+        rrsets, keys, origin, now = self._make_signed_nsec3_chain()
+        zone = dns.zone.Zone(origin)
+        for rrset in rrsets:
+            zone.replace_rdataset(rrset.name, rrset.to_rdataset())
+        dns.dnssec.validate_nsec3_chain(zone, keys, now=now)
+        dns.dnssec.validate_nsec3_chain(zone.nodes, keys, origin, now)
+
+    def testNSEC3ChainRejectsBrokenChain(self):
+        rrsets, _, origin, _ = self._make_signed_nsec3_chain()
+        for i, rrset in enumerate(rrsets):
+            if rrset.rdtype == dns.rdatatype.NSEC3:
+                nsec3 = rrset[0]
+                next = bytes([nsec3.next[0] ^ 0xFF]) + nsec3.next[1:]
+                rrsets[i] = dns.rrset.from_rdata(
+                    rrset.name, rrset.ttl, nsec3.replace(next=next)
+                )
+                break
+        with self.assertRaises(dns.dnssec.ValidationFailure):
+            dns.dnssec.validate_nsec3_chain(rrsets, origin=origin)
+
+    def testNSEC3ChainRejectsBadSignature(self):
+        rrsets, keys, origin, now = self._make_signed_nsec3_chain()
+        bad_rrsets = []
+        for rrset in rrsets:
+            if rrset.rdtype == dns.rdatatype.RRSIG:
+                signature = (
+                    bytes([rrset[0].signature[0] ^ 0xFF]) + rrset[0].signature[1:]
+                )
+                rrsig = rrset[0].replace(signature=signature)
+                bad_rrsets.append(dns.rrset.from_rdata(rrset.name, rrset.ttl, rrsig))
+            else:
+                bad_rrsets.append(rrset)
+        with self.assertRaises(dns.dnssec.ValidationFailure):
+            dns.dnssec.validate_nsec3_chain(bad_rrsets, keys, origin, now)
+
     def _assertMalformedRSADNSKEYFailsValidation(self, key_material):
         # RFC 4034 2.1.1 requires the key field to be present.  A DNSKEY
         # with no or truncated key material parses successfully from the

@@ -19,6 +19,12 @@ The dns.resolver.Resolver and dns.resolver.Answer Classes
       Assigning this field converts any strings into
       :py:class:`dns.nameserver.Nameserver` instances.
 
+   .. attribute:: fallback_nameservers
+
+      A ``list`` of ``str`` or :py:class:`dns.nameserver.Nameserver`, tried
+      only after all of the regular nameservers have failed.  An HTTPS URL
+      provides a DNS-over-HTTPS fallback.  The default is an empty list.
+
    .. attribute:: search
 
       A ``list`` of :py:class:`dns.name.Name` objects.  If the query name is a
@@ -138,6 +144,12 @@ The dns.resolver.Resolver and dns.resolver.Answer Classes
    .. attribute:: expiration
 
       A ``float``, the time when the answer expires.
+
+   .. attribute:: ttl
+
+      An ``int``, the remaining TTL of the answer in seconds.  This value
+      decreases when an answer is served from a cache and is zero once the
+      answer has expired.
 
    .. attribute:: canonical_name
 

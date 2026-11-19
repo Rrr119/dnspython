@@ -1,0 +1,17 @@
+{
+  "root": "/home/dev/feedback/uid28694",
+  "B": "/home/dev/feedback/uid28694",
+  "sha": "2d18c028a8301ed8a3f6b2f8e63a07a28276af8e",
+  "wslDistro": "Ubuntu-26.04",
+  "source": {
+    "owner": "rthalley",
+    "repo": "dnspython",
+    "sha": "2d18c028a8301ed8a3f6b2f8e63a07a28276af8e"
+  },
+  "fork": {
+    "owner": "Rrr119",
+    "repo": "dnspython",
+    "cloneUrl": "https://github.com/Rrr119/dnspython.git"
+  },
+  "at": "2026-11-19T16:51:00.315Z"
+}

@@ -17,6 +17,7 @@
 
 """DNS stub resolver."""
 
+import math
 import os
 import random
 import socket
@@ -281,6 +282,18 @@ class Answer:
         self.canonical_name = self.chaining_result.canonical_name
         self.rrset = self.chaining_result.answer
         self.expiration = time.time() + self.chaining_result.minimum_ttl
+
+    @property
+    def ttl(self) -> int:
+        """The remaining TTL of the answer in seconds."""
+
+        return max(0, math.ceil(self.expiration - time.time()))
+
+    @property
+    def remaining_ttl(self) -> int:
+        """The remaining TTL of the answer in seconds."""
+
+        return self.ttl
 
     def __getattr__(self, attr):  # pragma: no cover
         if attr != "rrset" and self.rrset is not None:
@@ -741,6 +754,13 @@ class _Resolution:
             )
             if self.resolver.rotate:
                 random.shuffle(self.nameservers)
+            self.nameservers.extend(
+                self.resolver._enrich_nameservers(
+                    self.resolver._fallback_nameservers,
+                    self.resolver.nameserver_ports,
+                    self.resolver.port,
+                )
+            )
             self.current_nameservers = self.nameservers[:]
             self.errors = []
             self.nameserver = None
@@ -931,6 +951,7 @@ class BaseResolver:
     rotate: bool
     ndots: int | None
     _nameservers: Sequence[str | dns.nameserver.Nameserver]
+    _fallback_nameservers: Sequence[str | dns.nameserver.Nameserver]
 
     def __init__(
         self,
@@ -964,6 +985,7 @@ class BaseResolver:
         if len(self.domain) == 0:  # pragma: no cover
             self.domain = dns.name.root
         self._nameservers = []
+        self._fallback_nameservers = []
         self.nameserver_ports = {}
         self.port = 53
         self.search = []
@@ -1240,6 +1262,34 @@ class BaseResolver:
         # We just call _enrich_nameservers() for checking
         self._enrich_nameservers(nameservers, self.nameserver_ports, self.port)
         self._nameservers = nameservers
+
+    @property
+    def fallback_nameservers(
+        self,
+    ) -> Sequence[str | dns.nameserver.Nameserver]:
+        """The nameservers to try after all regular nameservers fail."""
+
+        return self._fallback_nameservers
+
+    @fallback_nameservers.setter
+    def fallback_nameservers(
+        self, nameservers: Sequence[str | dns.nameserver.Nameserver]
+    ) -> None:
+        """Set the resolver's fallback nameservers.
+
+        Fallback nameservers are tried only after all of the regular
+        nameservers have been tried.  This is useful for configuring a
+        DNS-over-HTTPS resolver as a fallback for an internal DNS server.
+
+        :param nameservers: A list or tuple of nameservers, where each entry
+            is either a string (IP address or HTTPS URL) or a
+            :py:class:`dns.nameserver.Nameserver` instance.
+        :type nameservers: list or tuple
+        :raises ValueError: If *nameservers* is not a valid list of nameservers.
+        """
+
+        self._enrich_nameservers(nameservers, self.nameserver_ports, self.port)
+        self._fallback_nameservers = nameservers
 
 
 class Resolver(BaseResolver):

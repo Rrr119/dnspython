@@ -6,6 +6,17 @@ What's New in dnspython
 2.10.0 (in development)
 -----------------------
 
+* DNSSEC validation now includes ``dns.dnssec.validate_nsec3_chain()``, which
+  checks NSEC3 parameter consistency, hash-chain closure, and RRSIGs when keys
+  are supplied.
+
+* Resolvers have a new ``fallback_nameservers`` attribute.  These nameservers
+  are tried after all regular nameservers fail, which makes it possible to
+  configure a DNS-over-HTTPS fallback for an internal DNS server.
+
+* ``dns.resolver.Answer.ttl`` and ``Answer.remaining_ttl`` now report the
+  remaining TTL, so cached answers expose the time left before expiration.
+
 * The text form of an IPSECKEY record may now omit the public key, which RFC
   4025 section 3.1 makes optional, e.g. ``10 1 0 192.0.2.38`` with algorithm
   0, which means that no key is present.  Such a record could not be read from

@@ -20,13 +20,14 @@
 # pylint: disable=unused-import
 
 import base64
+import binascii
 import contextlib
 import functools
 import hashlib
 import math
 import struct
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from datetime import datetime
 from typing import Union, cast
 
@@ -49,6 +50,7 @@ from dns.rdtypes.ANY.CDS import CDS
 from dns.rdtypes.ANY.DNSKEY import DNSKEY
 from dns.rdtypes.ANY.DS import DS
 from dns.rdtypes.ANY.NSEC import NSEC, Bitmap
+from dns.rdtypes.ANY.NSEC3 import NSEC3
 from dns.rdtypes.ANY.NSEC3PARAM import NSEC3PARAM
 from dns.rdtypes.ANY.RRSIG import RRSIG, sigtime_to_posixtime
 from dns.rdtypes.dnskeybase import Flag
@@ -764,6 +766,178 @@ def nsec3_hash(
         digest = hashlib.sha1(digest + salt_encoded).digest()
 
     return base64.b32hexencode(digest).decode("utf-8")
+
+
+def _nsec3_rrsets(
+    source: (
+        dns.zone.Zone
+        | Mapping[dns.name.Name, dns.node.Node]
+        | Iterable[dns.rrset.RRset | tuple[dns.name.Name, dns.rdataset.Rdataset]]
+    ),
+) -> Iterator[dns.rrset.RRset]:
+    if isinstance(source, dns.zone.Zone):
+        if source.origin is None:
+            raise ValidationFailure("NSEC3 zone has no origin")
+        for name, node in source.nodes.items():
+            if source.relativize:
+                name = name.derelativize(source.origin)
+            for rdataset in node:
+                yield dns.rrset.from_rdata_list(name, rdataset.ttl, list(rdataset))
+    elif isinstance(source, Mapping):
+        mapping = cast(Mapping[dns.name.Name, dns.node.Node], source)
+        for name, node in mapping.items():
+            for rdataset in node:
+                yield dns.rrset.from_rdata_list(name, rdataset.ttl, list(rdataset))
+    else:
+        rrsets = cast(
+            Iterable[dns.rrset.RRset | tuple[dns.name.Name, dns.rdataset.Rdataset]],
+            source,
+        )
+        for rrset in rrsets:
+            if isinstance(rrset, tuple):
+                name, rdataset = rrset
+                yield dns.rrset.from_rdata_list(name, rdataset.ttl, list(rdataset))
+            elif isinstance(rrset, dns.rrset.RRset):
+                yield rrset
+            else:
+                raise ValidationFailure("invalid NSEC3 chain input")
+
+
+def _decode_nsec3_hash_label(label: bytes) -> bytes:
+    label = label.upper()
+    padded = label + b"=" * ((8 - len(label) % 8) % 8)
+    try:
+        decoded = base64.b32hexdecode(padded)
+    except binascii.Error as exc:
+        raise ValidationFailure("invalid NSEC3 owner hash") from exc
+    if base64.b32hexencode(decoded).rstrip(b"=") != label:
+        raise ValidationFailure("non-canonical NSEC3 owner hash")
+    return decoded
+
+
+def validate_nsec3_chain(
+    source: (
+        dns.zone.Zone
+        | Mapping[dns.name.Name, dns.node.Node]
+        | Iterable[dns.rrset.RRset | tuple[dns.name.Name, dns.rdataset.Rdataset]]
+    ),
+    keys: dict[dns.name.Name, dns.node.Node | dns.rdataset.Rdataset] | None = None,
+    origin: dns.name.Name | str | None = None,
+    now: float | None = None,
+    policy: Policy | None = None,
+) -> None:
+    """Validate the integrity and signatures of an NSEC3 chain.
+
+    The input may be a zone, a mapping from owner names to nodes, or an
+    iterable of NSEC3 and RRSIG(NSEC3) RRsets.  Every NSEC3 owner must contain
+    exactly one NSEC3 record, all records must use the same algorithm,
+    iterations, salt, and flags, and each record's next hashed owner name
+    must point to the next owner in hash order, with the last record wrapping
+    around to the first.
+
+    If *keys* is specified, every NSEC3 RRset must also have a valid RRSIG
+    made by one of those keys.  If *keys* is ``None``, only the chain
+    structure is checked.
+
+    :param source: The NSEC3 chain to validate.
+    :param keys: The key dictionary, keyed by :py:class:`dns.name.Name`, with
+        :py:class:`dns.node.Node` or :py:class:`dns.rdataset.Rdataset` values.
+    :param origin: The origin to use for relative names.
+    :type origin: :py:class:`dns.name.Name`, str, or ``None``
+    :param now: The current time in seconds since the epoch.  If ``None``,
+        the actual current time is used.
+    :type now: float or ``None``
+    :param policy: The policy to use.  If ``None``, ``dns.dnssec.default_policy``
+        is used.
+    :type policy: :py:class:`dns.dnssec.Policy` or ``None``
+    :raises ValidationFailure: If the chain is incomplete, malformed, or has
+        an invalid signature.
+    """
+
+    if isinstance(origin, str):
+        origin = dns.name.from_text(origin, dns.name.root)
+
+    nsec3_sets: dict[dns.name.Name, dns.rrset.RRset] = {}
+    rrsig_sets: dict[dns.name.Name, dns.rrset.RRset] = {}
+    for rrset in _nsec3_rrsets(source):
+        name = rrset.name
+        if not name.is_absolute():
+            if origin is None:
+                raise ValidationFailure("relative NSEC3 owner without an origin")
+            name = name.derelativize(origin)
+        if rrset.rdtype == dns.rdatatype.NSEC3:
+            if name in nsec3_sets:
+                raise ValidationFailure("multiple NSEC3 RRsets for owner")
+            nsec3_sets[name] = dns.rrset.from_rdata_list(name, rrset.ttl, list(rrset))
+        elif (
+            rrset.rdtype == dns.rdatatype.RRSIG and rrset.covers == dns.rdatatype.NSEC3
+        ):
+            previous = rrsig_sets.get(name)
+            if previous is None:
+                rrsig_sets[name] = dns.rrset.from_rdata_list(
+                    name, rrset.ttl, list(rrset)
+                )
+            else:
+                rrsig_sets[name] = dns.rrset.from_rdata_list(
+                    name, rrset.ttl, list(previous) + list(rrset)
+                )
+
+    if not nsec3_sets:
+        raise ValidationFailure("no NSEC3 records")
+
+    try:
+        parent = next(iter(nsec3_sets)).parent()
+    except dns.name.NoParent:
+        raise ValidationFailure("NSEC3 owner has no parent")
+    if origin is not None and parent != origin:
+        raise ValidationFailure("NSEC3 owner is not at the zone origin")
+
+    entries: list[tuple[bytes, dns.name.Name, dns.rrset.RRset, NSEC3]] = []
+    parameters: tuple[int, int, bytes, int] | None = None
+    for name, rrset in nsec3_sets.items():
+        if name.parent() != parent:
+            raise ValidationFailure("NSEC3 owners have different parents")
+        if len(rrset) != 1:
+            raise ValidationFailure("NSEC3 owner must have exactly one record")
+        nsec3 = rrset[0]
+        if not isinstance(nsec3, NSEC3):
+            raise ValidationFailure("expected an NSEC3 record")
+        if nsec3.algorithm != NSEC3Hash.SHA1:
+            raise ValidationFailure("unsupported NSEC3 hash algorithm")
+        current_parameters = (
+            nsec3.algorithm,
+            nsec3.iterations,
+            nsec3.salt,
+            nsec3.flags,
+        )
+        if parameters is None:
+            parameters = current_parameters
+        elif parameters != current_parameters:
+            raise ValidationFailure("inconsistent NSEC3 parameters")
+        hashed_owner = _decode_nsec3_hash_label(name.labels[0])
+        if len(hashed_owner) != len(nsec3.next):
+            raise ValidationFailure("invalid NSEC3 hash length")
+        entries.append((hashed_owner, name, rrset, nsec3))
+
+    entries.sort(key=lambda entry: entry[0])
+    for i, (_, _, _, nsec3) in enumerate(entries):
+        expected_next = entries[(i + 1) % len(entries)][0]
+        if nsec3.next != expected_next:
+            raise ValidationFailure("NSEC3 chain is not closed")
+
+    if keys is not None:
+        for _, name, rrset, _ in entries:
+            rrsig_set = rrsig_sets.get(name)
+            if rrsig_set is None:
+                raise ValidationFailure("NSEC3 RRset has no RRSIG")
+            validate(
+                rrset,
+                rrsig_set,
+                keys,
+                origin=parent,
+                now=now,
+                policy=policy,
+            )
 
 
 def make_ds_rdataset(
